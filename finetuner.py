@@ -211,3 +211,128 @@ class LoraLinear(nn.Module):
         
         # 4. Combinación aditiva
         return base_out + lora_out
+
+
+class QLoraPipeline:
+    """
+    Pipeline unificado para inyectar, entrenar y persistir adaptadores QLoRA.
+    """
+
+    def __init__(self, config: LoraConfig) -> None:
+        self.config = config
+
+    def _replace_layers(self, model: nn.Module, quantize_4bit: bool) -> None:
+        """Helper recursivo para inyectar wrappers LoraLinear."""
+        for name, module in list(model.named_children()):
+            if isinstance(module, nn.Linear):
+                # Comprobamos si el nombre coincide con alguno de los objetivos configurados
+                if any(target in name for target in self.config.target_modules):
+                    # Crear el reemplazo
+                    lora_layer = LoraLinear(
+                        base_layer=module,
+                        r=self.config.r,
+                        alpha=self.config.alpha,
+                        dropout=self.config.dropout,
+                        quantize_4bit=quantize_4bit
+                    )
+                    setattr(model, name, lora_layer)
+                    logger.info(f"Capa '{name}' adaptada exitosamente con LoRA (r={self.config.r}, alpha={self.config.alpha})")
+            else:
+                # Recursión para submódulos jerárquicos
+                self._replace_layers(module, quantize_4bit)
+
+    def apply_lora(self, model: nn.Module, quantize_4bit: bool = True) -> nn.Module:
+        """
+        Reemplaza recursivamente las capas nn.Linear objetivo por capas LoraLinear adaptadas
+        y congela todos los parámetros del modelo base para asegurar que solo se entrenen
+        las matrices lora_A y lora_B.
+        """
+        self._replace_layers(model, quantize_4bit)
+        
+        # Congelar todos los parámetros
+        for param in model.parameters():
+            param.requires_grad = False
+            
+        # Descongelar únicamente las matrices de adaptador lora_A y lora_B
+        for name, param in model.named_parameters():
+            if "lora_A" in name or "lora_B" in name:
+                param.requires_grad = True
+                
+        return model
+
+    def get_trainable_parameters(self, model: nn.Module) -> List[Tuple[str, nn.Parameter]]:
+        """Devuelve únicamente los parámetros que tienen activado el cálculo de gradiente."""
+        trainables = []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                trainables.append((name, param))
+        return trainables
+
+    def print_trainable_parameters_summary(self, model: nn.Module) -> None:
+        """Muestra un resumen analítico del porcentaje de parámetros entrenables en el modelo."""
+        total_params = 0
+        trainable_params = 0
+        for _, param in model.named_parameters():
+            # Si el modelo tiene pesos cuantizados en buffers, sumamos su tamaño correspondiente
+            total_params += param.numel()
+            if param.requires_grad:
+                trainable_params += param.numel()
+                
+        # Contabilizar el tamaño de los pesos de la capa base cuantizada almacenada en buffers
+        for _, buf in model.named_buffers():
+            if "quantized_weight" in _ or "original_weight_shape" in _:
+                # Evitamos duplicados, solo contamos los índices cuantizados como representativos
+                if "indices" in _:
+                    total_params += buf.numel()
+
+        percentage = 100 * trainable_params / max(total_params, 1)
+        logger.info(f"Parámetros entrenables: {trainable_params:,} | Parámetros totales: {total_params:,} | Ratio: {percentage:.4f}%")
+
+    def save_adapters(self, model: nn.Module, output_dir: str) -> str:
+        """
+        Guarda únicamente las matrices de adaptador entrenadas y su configuración.
+        
+        Esto demuestra el beneficio de PEFT, donde el checkpoint resultante pesa unos pocos KB.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Extraer estado del adaptador
+        adapter_state_dict = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad and ("lora_A" in name or "lora_B" in name):
+                adapter_state_dict[name] = param.data.cpu()
+                
+        # Guardar pesos
+        weights_path = os.path.join(output_dir, "adapter_model.bin")
+        torch.save(adapter_state_dict, weights_path)
+        
+        # Guardar configuración
+        config_path = os.path.join(output_dir, "adapter_config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(self.config.model_dump(), f, indent=2)
+            
+        logger.info(f"Adaptadores guardados en '{output_dir}'. Tamaño estimado: {os.path.getsize(weights_path) / 1024:.2f} KB")
+        return output_dir
+
+    def load_adapters(self, model: nn.Module, adapter_dir: str) -> None:
+        """
+        Carga y acopla las matrices del adaptador guardadas en un modelo con wrappers LoRA.
+        """
+        weights_path = os.path.join(adapter_dir, "adapter_model.bin")
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(f"Archivo de pesos del adaptador '{weights_path}' no encontrado.")
+            
+        adapter_state_dict = torch.load(weights_path)
+        
+        # Cargar los parámetros en el modelo
+        model_state = model.state_dict()
+        for name, param in adapter_state_dict.items():
+            if name in model_state:
+                # Comprobar que coincida el tamaño
+                if model_state[name].shape == param.shape:
+                    model_state[name].copy_(param)
+                    logger.info(f"Parámetro adaptador '{name}' cargado correctamente.")
+                else:
+                    raise ValueError(f"Error de dimensiones para '{name}': {model_state[name].shape} vs {param.shape}")
+            else:
+                logger.warning(f"Parámetro '{name}' no coincide con la estructura del modelo actual.")
