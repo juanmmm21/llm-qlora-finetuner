@@ -122,3 +122,92 @@ class NF4Quantizer:
             reconstructed_flat = reconstructed_flat[:-padding_size]
             
         return reconstructed_flat.view(original_shape)
+
+
+class LoraLinear(nn.Module):
+    """
+    Envoltura (wrapper) LoRA para una capa lineal.
+    
+    Mantiene la capa lineal original congelada y opcionalmente cuantizada en NF4,
+    inyectando un camino alternativo de bajo rango (matrices lora_A y lora_B).
+    """
+
+    def __init__(
+        self,
+        base_layer: nn.Linear,
+        r: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.05,
+        quantize_4bit: bool = True,
+        block_size: int = 64
+    ) -> None:
+        super().__init__()
+        self.in_features = base_layer.in_features
+        self.out_features = base_layer.out_features
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / r
+        self.quantize_4bit = quantize_4bit
+        self.block_size = block_size
+        
+        # Copiamos el sesgo (bias) si existe
+        if base_layer.bias is not None:
+            self.bias = nn.Parameter(base_layer.bias.data.clone())
+        else:
+            self.register_parameter('bias', None)
+            
+        # Si activamos cuantización QLoRA, comprimimos los pesos de la capa base a NF4
+        if quantize_4bit:
+            indices, scales = NF4Quantizer.quantize(base_layer.weight.data, block_size)
+            # Guardamos como buffers para evitar que PyTorch intente calcular gradientes para la capa base
+            self.register_buffer("quantized_weight_indices", indices)
+            self.register_buffer("quantized_weight_scales", scales)
+            self.register_buffer("original_weight_shape", torch.tensor(base_layer.weight.shape))
+            logger.info(f"Capa base cuantizada a NF4. Ahorro de memoria simulado: ~75% de VRAM")
+        else:
+            # Si no se cuantiza, guardamos el peso original y lo congelamos explícitamente
+            self.weight = nn.Parameter(base_layer.weight.data.clone(), requires_grad=False)
+
+        # Definición de las matrices de bajo rango adaptadoras (trainables)
+        # lora_A se inicializa con Kaiming Uniform para romper simetrías.
+        # lora_B se inicializa en ceros, garantizando que el delta (B * A) al inicio sea exactamente 0.
+        self.lora_A = nn.Parameter(torch.zeros((r, self.in_features)), requires_grad=True)
+        self.lora_B = nn.Parameter(torch.zeros((self.out_features, r)), requires_grad=True)
+        
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+        
+        # Dropout regulador para las activaciones
+        self.lora_dropout = nn.Dropout(p=dropout)
+
+    def get_dequantized_weight(self) -> torch.Tensor:
+        """Decuantiza dinámicamente los pesos base de la capa para computar el forward."""
+        if self.quantize_4bit:
+            shape = torch.Size(self.quantized_weight_shape_list())
+            return NF4Quantizer.dequantize(
+                self.quantized_weight_indices,
+                self.quantized_weight_scales,
+                shape,
+                self.block_size
+            ).to(self.lora_A.dtype)
+        return self.weight
+
+    def quantized_weight_shape_list(self) -> List[int]:
+        """Obtiene la forma original del peso cuantizado en formato lista compatible con CPU/GPU."""
+        return self.original_weight_shape.tolist()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. Obtener peso base decuantizado dinámicamente
+        w_base = self.get_dequantized_weight()
+        
+        # 2. Computar proyección base (W_base * x)
+        base_out = nn.functional.linear(x, w_base, self.bias)
+        
+        # 3. Computar adaptación de bajo rango: (x * lora_A^T) * lora_B^T * scaling
+        # Aplicamos dropout a la entrada para prevenir co-adaptación
+        x_dropped = self.lora_dropout(x)
+        lora_out = (x_dropped @ self.lora_A.t()) @ self.lora_B.t()
+        lora_out = lora_out * self.scaling
+        
+        # 4. Combinación aditiva
+        return base_out + lora_out
