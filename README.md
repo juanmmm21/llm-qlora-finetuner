@@ -1,85 +1,85 @@
 # LLM QLoRA Finetuner
 
-Pipeline modular y eficiente de alto rendimiento para realizar el ajuste fino (fine-tuning) de modelos de lenguaje mediante Adaptacion de Bajo Rango (LoRA) y cuantizacion de 4 bits (QLoRA) en PyTorch, disenado para optimizar el consumo de memoria grafica (VRAM) en hardware de recursos limitados.
+Modular, high-performance, and efficient pipeline for fine-tuning language models via Low-Rank Adaptation (LoRA) and 4-bit quantization (QLoRA) in PyTorch, designed to optimize graphics memory (VRAM) usage on resource-constrained hardware.
 
-Este modulo implementa de forma nativa la inyeccion de capas adaptadoras de bajo rango y la cuantizacion bloque a bloque bajo el formato NormalFloat4 (NF4) propuesto por Tim Dettmers et al. (2023), permitiendo emular la compresion y ejecucion de modelos cuantizados sin depender de librerias binarias compiladas de CUDA de terceros.
+This module natively implements low-rank adapter layer injection and block-by-block quantization under the NormalFloat4 (NF4) format proposed by Tim Dettmers et al. (2023), allowing the compression and execution of quantized models to be emulated without relying on third-party compiled CUDA binary libraries.
 
-## Fundamentos Teoricos y Arquitectura de Computo
+## Theoretical Foundations and Compute Architecture
 
-La optimizacion de QLoRA reduce los requisitos de memoria del modelo base en aproximadamente un 75% al cuantizar sus tensores estaticos, mientras inyecta matrices entrenables de bajo rango que capturan los gradientes del ajuste fino.
+QLoRA optimization reduces the base model's memory requirements by approximately 75% by quantizing its static tensors, while injecting trainable low-rank matrices that capture the fine-tuning gradients.
 
 ```mermaid
 flowchart TD
-    Input[Vector de Entrada: x] --> FrozenBranch[Rama Base Cuantizada - Congelada]
-    Input --> LoraBranch[Rama Adaptadora LoRA - Entrenable]
+    Input[Input Vector: x] --> FrozenBranch[Quantized Base Branch - Frozen]
+    Input --> LoraBranch[LoRA Adapter Branch - Trainable]
     
-    subgraph FrozenBranch [Inferencia Base Cuantizada]
+    subgraph FrozenBranch [Quantized Base Inference]
         direction TB
-        LoadIndices[Cargar indices de pesos de 4-bits: Q_W0]
-        LoadScales[Cargar escalas de bloque de 32-bits: Scales]
-        Dequantize[Decuantizacion Dinamica: W0_tilde = Scale * NF4_Quantile_Q]
-        MatMulBase[Multiplicacion: h0 = W0_tilde * x]
+        LoadIndices[Load 4-bit weight indices: Q_W0]
+        LoadScales[Load 32-bit block scales: Scales]
+        Dequantize[Dynamic Dequantization: W0_tilde = Scale * NF4_Quantile_Q]
+        MatMulBase[Multiplication: h0 = W0_tilde * x]
         LoadIndices --> Dequantize
         LoadScales --> Dequantize
     end
     
-    subgraph LoraBranch [Adaptadores de Bajo Rango]
+    subgraph LoraBranch [Low-Rank Adapters]
         direction TB
-        Dropout[Dropout] --> DownProj[Down-Projection: A de dimension d x r]
-        DownProj --> UpProj[Up-Projection: B de dimension r x k]
-        UpProj --> Scale[Escalado: * alpha / r]
-        Scale --> MatMulLora[Resultado: h_lora = B * A * dropout_x * scale]
+        Dropout[Dropout] --> DownProj[Down-Projection: A of dimension d x r]
+        DownProj --> UpProj[Up-Projection: B of dimension r x k]
+        UpProj --> Scale[Scaling: * alpha / r]
+        Scale --> MatMulLora[Result: h_lora = B * A * dropout_x * scale]
     end
     
-    MatMulBase --> Sum[Suma de Activaciones: h = h0 + h_lora]
+    MatMulBase --> Sum[Activation Sum: h = h0 + h_lora]
     MatMulLora --> Sum
-    Sum --> Output[Activas / Siguiente Capa]
+    Sum --> Output[Activations / Next Layer]
 ```
 
-### 1. Adaptacion de Bajo Rango (LoRA)
+### 1. Low-Rank Adaptation (LoRA)
 
-Durante el ajuste fino, en lugar de actualizar la matriz completa de parametros del modelo $W_0 \in \mathbb{R}^{d \times k}$ (lo que requiere una gran cantidad de memoria para almacenar los momentos del optimizador), LoRA congela $W_0$ y descompone la matriz de actualizacion $\Delta W$ en dos matrices de bajo rango entrenables $A$ y $B$:
+During fine-tuning, instead of updating the model's full parameter matrix $W_0 \in \mathbb{R}^{d \times k}$ (which requires a large amount of memory to store the optimizer's moments), LoRA freezes $W_0$ and decomposes the update matrix $\Delta W$ into two trainable low-rank matrices $A$ and $B$:
 
 $$W = W_0 + \Delta W = W_0 + \frac{\alpha}{r} (B \cdot A)$$
 
-Donde:
-*   $A \in \mathbb{R}^{r \times d}$ es la matriz de proyeccion hacia abajo (Down-Projection), inicializada mediante distribucion normal uniforme de Kaiming para permitir el flujo inicial de gradientes.
-*   $B \in \mathbb{R}^{k \times r}$ es la matriz de proyeccion hacia arriba (Up-Projection), inicializada en cero absoluto para garantizar que la alteracion inicial sea nula ($\Delta W = 0$) y el modelo comience el ajuste con las mismas salidas exactas que el modelo pre-entrenado.
-*   $r$ es el rango de la descomposicion ($r \ll d$).
-*   $\alpha$ es un factor de escala constante que estabiliza el entrenamiento al alterar el rango, evitando reajustar los hiperparametros de optimizacion.
+Where:
+*   $A \in \mathbb{R}^{r \times d}$ is the down-projection matrix, initialized via Kaiming uniform normal distribution to allow the initial flow of gradients.
+*   $B \in \mathbb{R}^{k \times r}$ is the up-projection matrix, initialized to absolute zero to guarantee that the initial alteration is null ($\Delta W = 0$) and the model begins fine-tuning with the exact same outputs as the pre-trained model.
+*   $r$ is the rank of the decomposition ($r \ll d$).
+*   $\alpha$ is a constant scaling factor that stabilizes training when the rank is changed, avoiding the need to readjust the optimization hyperparameters.
 
-El paso de forward pass se define como:
+The forward pass step is defined as:
 $$h = W_0 x + \frac{\alpha}{r} B(A(\text{dropout}(x)))$$
 
-### 2. Cuantizacion NormalFloat4 (NF4) Bloque a Bloque
+### 2. Block-by-Block NormalFloat4 (NF4) Quantization
 
-El tipo de datos NormalFloat4 (NF4) es un esquema de cuantizacion optimizado teoricamente para pesos de redes neuronales que siguen una distribucion normal con media cero y desviacion estandar constante. El cuantizador `NF4Quantizer` divide los pesos a cuantizar en bloques estáticos:
+The NormalFloat4 (NF4) data type is a quantization scheme theoretically optimized for neural network weights that follow a normal distribution with zero mean and constant standard deviation. The `NF4Quantizer` divides the weights to be quantized into static blocks:
 
-1.  **Bloques Estaticos:** La matriz de pesos se divide en bloques de tamano $B_{\text{size}} = 64$ elementos.
-2.  **Escala Absmax:** Para cada bloque $i$, se computa la escala como el valor absoluto maximo de sus pesos:
+1.  **Static Blocks:** The weight matrix is divided into blocks of size $B_{\text{size}} = 64$ elements.
+2.  **Absmax Scale:** For each block $i$, the scale is computed as the maximum absolute value of its weights:
     $$s_i = \max_{j} |w_{ij}|$$
-3.  **Normalizacion:** Los pesos del bloque se normalizan al rango $[-1, 1]$ mediante $w'_{ij} = \frac{w_{ij}}{s_i}$ y se mapean al indice del cuantil NF4 mas cercano de los 16 cuantiles teoricos predefinidos (guardando cada peso en un espacio de 4 bits).
-4.  **Decuantizacion al Vuelo:** Durante la propagacion hacia adelante (forward pass), el motor decuantiza dinamicamente el bloque para realizar las operaciones algebraicas en punto flotante standard (`fp32` o `fp16`):
+3.  **Normalization:** The block's weights are normalized to the range $[-1, 1]$ via $w'_{ij} = \frac{w_{ij}}{s_i}$ and mapped to the nearest NF4 quantile index among the 16 predefined theoretical quantiles (storing each weight in a 4-bit space).
+4.  **On-the-Fly Dequantization:** During the forward pass, the engine dynamically dequantizes the block to perform the algebraic operations in standard floating point (`fp32` or `fp16`):
     $$\tilde{w}_{ij} = s_i \cdot \text{NF4}[Q_{\text{index}}(w'_{ij})]$$
 
-## Conexión con el Ecosistema
+## Connection to the Ecosystem
 
-Este modulo actua como el motor de entrenamiento local de la suite:
-1.  **synthetic-data-generator / dataset-version-control:** Suministran y versionan los conjuntos de datos en formato JSON de Instruction Tuning y DPO para alimentar los bucles de entrenamiento de PyTorch.
-2.  **llm-inference-server:** Al finalizar el entrenamiento del modulo, los adaptadores (archivos de pesos PEFT ligeros en formato JSON/PT) se exportan para ser acoplados al modelo base limpio servido por el servidor de inferencia de produccion.
-3.  **llm-eval-harness:** Evalua la degradacion o ganancia de precision de los pesos resultantes de la decuantizacion NF4 y LoRA frente al modelo base de referencia.
+This module acts as the suite's local training engine:
+1.  **synthetic-data-generator / dataset-version-control:** Supply and version the Instruction Tuning and DPO datasets in JSON format to feed the PyTorch training loops.
+2.  **llm-inference-server:** Once the module's training finishes, the adapters (lightweight PEFT weight files in JSON/PT format) are exported to be attached to the clean base model served by the production inference server.
+3.  **llm-eval-harness:** Evaluates the accuracy degradation or gain of the weights resulting from NF4 dequantization and LoRA against the reference base model.
 
-## Estructura del Proyecto
+## Project Structure
 
-*   `finetuner.py`: Implementa el cuantizador `NF4Quantizer` (cuantizacion y decuantizacion por bloques), la capa envolvente `LoraLinear` compatible con PyTorch Autograd y la clase orquestadora `QLoraFinetuner`.
-*   `test_finetuner.py`: Suite de test unitarios que comprueba la estabilidad de los gradientes en las capas LoRA, la precision matematica de la de-cuantizacion NF4 y la importacion/exportacion de adaptadores.
-*   `example.py`: Demostracion ejecutable que entrena un modelo multicapa base cuantizado en NF4 utilizando adaptadores LoRA y un optimizador AdamW sobre un dataset sintetico, mostrando la reduccion del loss y guardando los pesos del adaptador PEFT en disco.
+*   `finetuner.py`: Implements the `NF4Quantizer` (block-based quantization and dequantization), the `LoraLinear` wrapper layer compatible with PyTorch Autograd, and the `QLoraFinetuner` orchestrator class.
+*   `test_finetuner.py`: Unit test suite that checks gradient stability in the LoRA layers, the mathematical accuracy of NF4 dequantization, and adapter import/export.
+*   `example.py`: Executable demo that trains an NF4-quantized multi-layer base model using LoRA adapters and an AdamW optimizer on a synthetic dataset, showing the loss reduction and saving the PEFT adapter weights to disk.
 
-## Instalacion y Uso
+## Installation and Usage
 
-### 1. Activar el Entorno Local e Instalar Dependencias
+### 1. Activate the Local Environment and Install Dependencies
 
-Dado que el modulo implementa la decuantizacion bloque por bloque de forma nativa en tensores de PyTorch, no requiere de compiladores externos de CUDA:
+Since the module natively implements block-by-block dequantization on PyTorch tensors, it does not require external CUDA compilers:
 
 ```bash
 python3 -m venv .venv
@@ -87,20 +87,20 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Ejecutar la Suite de Pruebas Unitarias
+### 2. Run the Unit Test Suite
 
-Compruebe la consistencia matematica de los cuantiles de precision NF4 y la actualizacion de parametros LoRA:
+Check the mathematical consistency of the NF4 precision quantiles and the LoRA parameter update:
 
 ```bash
 .venv/bin/python -m unittest test_finetuner.py
 ```
 
-### 3. Ejecutar la Demostracion de Entrenamiento
+### 3. Run the Training Demo
 
-Inicie la simulacion del entrenamiento parametrico:
+Start the parametric training simulation:
 
 ```bash
 .venv/bin/python example.py
 ```
 
-El script cuantizara un modelo lineal base a 4-bits (NF4), inyectara los adaptadores entrenables, correra un ciclo de optimizacion AdamW y finalmente guardara y volvera a cargar los adaptadores exportados para verificar la inferencia integrada.
+The script will quantize a base linear model to 4 bits (NF4), inject the trainable adapters, run an AdamW optimization cycle, and finally save and reload the exported adapters to verify integrated inference.
