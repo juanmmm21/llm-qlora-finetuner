@@ -4,7 +4,7 @@ import shutil
 import tempfile
 import torch
 import torch.nn as nn
-from finetuner import LoraConfig, LoraLinear, QLoraPipeline, NF4Quantizer
+from llm_qlora_finetuner.finetuner import LoraConfig, LoraLinear, QLoraPipeline, NF4Quantizer
 
 class TestQLoraFinetuner(unittest.TestCase):
 
