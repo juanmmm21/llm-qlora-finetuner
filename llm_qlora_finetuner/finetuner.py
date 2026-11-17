@@ -7,8 +7,6 @@ import torch
 import torch.nn as nn
 from pydantic import BaseModel, Field
 
-# Configuración del registrador de eventos
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Representación matemática de los 16 cuantiles del tipo NormalFloat4 (NF4)
