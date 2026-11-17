@@ -75,6 +75,26 @@ This module acts as the suite's local training engine:
 *   `test_finetuner.py`: Unit test suite that checks gradient stability in the LoRA layers, the mathematical accuracy of NF4 dequantization, and adapter import/export.
 *   `example.py`: Executable demo that trains an NF4-quantized multi-layer base model using LoRA adapters and an AdamW optimizer on a synthetic dataset, showing the loss reduction and saving the PEFT adapter weights to disk.
 
+## Training a real classifier with LoRA / QLoRA
+
+Since `0.1.0`, `LoraClassifier` fine-tunes any Hugging Face encoder for text classification with
+this package's own `LoraLinear` adapters (base weights frozen, stored in NF4 with
+`quantize_4bit=True`) and a linear head over mean-pooled states. Only adapters and head are
+trained and saved; on CPU a 118M-parameter multilingual MiniLM trains on ~1,000 short texts in
+minutes.
+
+```python
+from llm_qlora_finetuner import LoraClassifier
+
+clf = LoraClassifier(["project", "general", "trivial"],
+                     base_model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+clf.fit(texts, labels, contexts, epochs=3)          # contexts: e.g. [["active_project"], None, ...]
+clf.predict("sigue", ["active_project"])
+clf.save("router-v2")                               # model.json kind "lora-classifier" + adapters.pt
+```
+
+Needs `pip install "llm-qlora-finetuner[hf]"` (transformers).
+
 ## Using it as a package
 
 Since `0.1.0` the code lives in the `llm_qlora_finetuner` package and the repository is
