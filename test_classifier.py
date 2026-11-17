@@ -44,6 +44,16 @@ class TestLoraClassifier(unittest.TestCase):
             again = LoraClassifier.load(tmp)
             np.testing.assert_allclose(again.predict_proba(texts[:4]), clf.predict_proba(texts[:4]), atol=1e-5)
 
+    def test_early_stopping_keeps_the_best_epoch(self) -> None:
+        texts, labels = toy()
+        clf = LoraClassifier(["warm", "cold"], base_model=TINY, lora=self.lora, quantize_4bit=False)
+        clf.fit(texts, labels, epochs=40, lr=5e-3, batch_size=8, validation=(texts[:6] + texts[10:16], labels[:6] + labels[10:16], None), patience=3)
+        accs = [h["val_accuracy"] for h in clf.history]
+        self.assertLessEqual(len(accs), 40)
+        best = max(accs)
+        kept = np.mean([clf.predict(t)[0] == y for t, y in zip(texts[:6] + texts[10:16], labels[:6] + labels[10:16])])
+        self.assertAlmostEqual(kept, best)
+
     def test_context_tags(self) -> None:
         self.assertEqual(with_context("sigue", ["active_project"]), "[active_project] sigue")
         self.assertEqual(with_context("hola", None), "hola")

@@ -94,7 +94,13 @@ class LoraClassifier:
         lr: float = 2e-3,
         batch_size: int = 16,
         seed: int = 0,
+        validation: Optional[tuple] = None,
+        patience: int = 2,
     ) -> "LoraClassifier":
+        """Train adapters and head. With ``validation=(texts, labels, contexts)`` the accuracy on
+        it is measured after every epoch, training stops after ``patience`` epochs without
+        improvement and the best epoch's adapters are kept (early stopping: pick the epoch on
+        data that is neither training nor final evaluation)."""
         torch.manual_seed(seed)
         rng = random.Random(seed)
         contexts = contexts or [None] * len(texts)
@@ -106,6 +112,7 @@ class LoraClassifier:
         loss_fn = nn.CrossEntropyLoss(weight=weights)
         opt = torch.optim.AdamW(self.trainable_parameters(), lr=lr, weight_decay=0.01)
         order = list(range(len(rows)))
+        best_acc, best_state, since_best = -1.0, None, 0
         self.model.train()
         for epoch in range(1, epochs + 1):
             rng.shuffle(order)
@@ -119,7 +126,23 @@ class LoraClassifier:
                 opt.step()
                 total += float(loss.detach()) * len(idx)
                 n += len(idx)
-            self.history.append({"epoch": epoch, "loss": total / n, "seconds": time.perf_counter() - start})
+            record: Dict[str, float] = {"epoch": epoch, "loss": total / n, "seconds": time.perf_counter() - start}
+            if validation is not None:
+                v_texts, v_labels, v_contexts = validation
+                probs = self.predict_proba(v_texts, v_contexts)
+                acc = float(np.mean([self.labels[int(i)] == g for i, g in zip(probs.argmax(1), v_labels)]))
+                record["val_accuracy"] = acc
+                self.model.train()
+                if acc > best_acc:
+                    best_acc, since_best = acc, 0
+                    best_state = {k: v.detach().clone() for k, v in self.model.state_dict().items() if "lora_" in k or k.startswith("head.")}
+                else:
+                    since_best += 1
+            self.history.append(record)
+            if validation is not None and since_best >= patience:
+                break
+        if best_state is not None:
+            self.model.load_state_dict(best_state, strict=False)
         self.model.eval()
         return self
 
