@@ -2,7 +2,7 @@ import os
 import json
 import math
 import logging
-from typing import Dict, List, Any, Tuple, Optional
+from typing import List, Tuple
 import torch
 import torch.nn as nn
 from pydantic import BaseModel, Field
@@ -163,7 +163,7 @@ class LoraLinear(nn.Module):
             self.register_buffer("quantized_weight_indices", indices)
             self.register_buffer("quantized_weight_scales", scales)
             self.register_buffer("original_weight_shape", torch.tensor(base_layer.weight.shape))
-            logger.info(f"Capa base cuantizada a NF4. Ahorro de memoria simulado: ~75% de VRAM")
+            logger.info("Capa base cuantizada a NF4. Ahorro de memoria simulado: ~75% de VRAM")
         else:
             # Si no se cuantiza, guardamos el peso original y lo congelamos explícitamente
             self.weight = nn.Parameter(base_layer.weight.data.clone(), requires_grad=False)
